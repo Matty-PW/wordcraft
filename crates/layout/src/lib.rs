@@ -54,11 +54,22 @@ pub struct LayoutOptions {
     pub show_hidden: bool,
     /// Final text ("No Markup"): tracked deletions take no space and draw nothing.
     pub hide_deleted: bool,
+    /// Show revisions in balloons: tracked deletions in the body take no space and draw nothing
+    /// (the editor shows them in balloons beside the page). Headers, footers, notes and text
+    /// boxes get no balloons, so their deletions stay inline.
+    pub deletions_in_balloons: bool,
     /// Check spelling and grammar (squiggles).
     pub proofing: bool,
     /// Show field codes (`{ PAGE }`, shaded) instead of field results (View › Field Codes, Alt+F9).
     /// A field whose own `code` flag is set shows the other one.
     pub field_codes: bool,
+}
+
+impl LayoutOptions {
+    /// Whether tracked deletions in `story` take no space and draw nothing.
+    pub fn hides_deleted(&self, story: StoryRef) -> bool {
+        self.hide_deleted || (self.deletions_in_balloons && story == StoryRef::Body)
+    }
 }
 
 /// Something placed on a page (page coordinates, points, y down).
@@ -314,6 +325,7 @@ struct Key {
     excl: u64,
     eq: u32,
     grid: (u32, u32, u32, bool),
+    hide_deleted: bool,
 }
 
 /// Memoised paragraph layouts.
@@ -357,6 +369,7 @@ fn env_hash(doc: &Document, opts: &LayoutOptions) -> u64 {
         s,
         opts.show_hidden,
         opts.hide_deleted,
+        opts.deletions_in_balloons,
         opts.proofing,
         opts.field_codes,
         wordcraft_proof::user_dictionary().len(),
@@ -396,6 +409,9 @@ struct Ctx<'a> {
     chains: textbox::Chains,
     /// The current section's document grid (body text only: none for headers and footers).
     grid: para::Grid,
+    /// Whether tracked deletions are left out in the story being laid out
+    /// ([`LayoutOptions::hides_deleted`]): the body's, or the story of the [`layout_box`] at work.
+    hide_deleted: bool,
 }
 
 impl Ctx<'_> {
@@ -487,6 +503,7 @@ impl Ctx<'_> {
             excl: if exclusions.is_empty() { 0 } else { hash_of(&format!("{exclusions:?}")) },
             eq: if eq_here > 0 { eq_number } else { 0 },
             grid: self.grid.key(),
+            hide_deleted: self.hide_deleted,
         };
         self.cache.used.insert(key.clone());
         if let Some(pl) = self.cache.paras.get(&key) {
@@ -501,7 +518,7 @@ impl Ctx<'_> {
             fields: &self.fields,
             show_hidden: self.opts.show_hidden,
             field_codes: self.opts.field_codes,
-            hide_deleted: self.opts.hide_deleted,
+            hide_deleted: self.hide_deleted,
             table,
             proofing: self.opts.proofing,
             exclusions,
@@ -644,6 +661,9 @@ fn layout_box(
     depth: usize,
     frame: Option<PageFrame>,
 ) -> BoxLayout {
+    // Deletions in balloons leave the body's text only: a header, note or text box keeps its own
+    // inline (restored for the story around this box when it's done).
+    let outer_hide = std::mem::replace(&mut ctx.hide_deleted, ctx.opts.hides_deleted(story));
     let mut items = Vec::new();
     // Pictures behind the text go first; `behind` counts them.
     let mut behind = 0;
@@ -672,7 +692,7 @@ fn layout_box(
                 // Floating objects anchored here: place them, then wrap the text around them.
                 // One left out of the layout (hidden, or deleted in the final text) takes no room.
                 let mut floats = HashMap::new();
-                let left_out = left_out_objects(ctx.doc, p, table.map(|t| &t.chr), ctx.opts.show_hidden, ctx.opts.hide_deleted);
+                let left_out = left_out_objects(ctx.doc, p, table.map(|t| &t.chr), ctx.opts.show_hidden, ctx.hide_deleted);
                 for (oi, o) in p.objects.iter().enumerate() {
                     let Some((w, h, float)) = floating(o) else { continue };
                     if left_out(oi) {
@@ -738,6 +758,7 @@ fn layout_box(
         }
     }
     let floats_bottom = float_tables.iter().map(|r| r.bottom()).fold(0.0, f32::max);
+    ctx.hide_deleted = outer_hide;
     BoxLayout { items, height: y.max(0.0), floats_bottom }
 }
 
@@ -1400,7 +1421,8 @@ fn layout_pass(doc: &Document, cache: &mut LayoutCache, opts: &LayoutOptions, no
         cache.env = env;
     }
     cache.used.clear();
-    let notes = note_info(doc, opts.hide_deleted, note_pages);
+    // Note references are counted as the body shows them.
+    let notes = note_info(doc, opts.hides_deleted(StoryRef::Body), note_pages);
     let notes_hash = hash_of(&{
         let mut v: Vec<_> = notes.iter().map(|(a, b)| (*a, b.n, b.fmt)).collect();
         v.sort_by_key(|(a, ..)| *a);
@@ -1410,6 +1432,7 @@ fn layout_pass(doc: &Document, cache: &mut LayoutCache, opts: &LayoutOptions, no
         doc,
         cache,
         opts,
+        hide_deleted: opts.hides_deleted(StoryRef::Body),
         counters: Counters::default(),
         fields: FieldCtx {
             page: 1,
@@ -2014,7 +2037,7 @@ fn anchor_floats(
         let frame = PageFrame { sect: pb.sect, origin: (0.0, 0.0) };
         // An object left out of the layout (hidden, or deleted in the final text) is not placed, so
         // it takes no room either.
-        let left_out = left_out_objects(ctx.doc, p, None, ctx.opts.show_hidden, ctx.opts.hide_deleted);
+        let left_out = left_out_objects(ctx.doc, p, None, ctx.opts.show_hidden, ctx.hide_deleted);
         for (oi, o) in p.objects.iter().enumerate() {
             let Some((w, h, float)) = floating(o) else { continue };
             if left_out(oi) {
@@ -2064,7 +2087,7 @@ fn place_objects(
     let (mut behind, mut front) = (Vec::new(), Vec::new());
     let Some(fl) = pl.lines.get(l0) else { return (behind, front) };
     // Objects left out of the layout (hidden, or deleted in the final text) aren't placed.
-    let left_out = left_out_objects(ctx.doc, p, at.table_chr, ctx.opts.show_hidden, ctx.opts.hide_deleted);
+    let left_out = left_out_objects(ctx.doc, p, at.table_chr, ctx.opts.show_hidden, ctx.hide_deleted);
     for li in l0..l1 {
         let Some(line) = pl.lines.get(li) else { continue };
         for k in line.c0..line.c1 {
@@ -2384,7 +2407,7 @@ fn next_first_line(ctx: &mut Ctx, block: usize, width: f32) -> f32 {
                 fields: &ctx.fields,
                 show_hidden: ctx.opts.show_hidden,
                 field_codes: ctx.opts.field_codes,
-                hide_deleted: ctx.opts.hide_deleted,
+                hide_deleted: ctx.opts.hides_deleted(StoryRef::Body),
                 table: None,
                 proofing: false,
                 exclusions: &[],
